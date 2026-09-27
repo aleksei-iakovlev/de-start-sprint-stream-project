@@ -62,10 +62,11 @@ df = (
 
 
 query = (restaurant_read_stream_df.join(df, f.col("restaurant_id"))
-        .withColumn("current_date", f.current_date())
-        .writeStream
-        .outputMode("append")
-        .format("console")
-        .option("truncate", False)
-        .start())
+         .dropDuplicates()
+         .withColumn("current_date", f.current_date())
+         .writeStream
+         .outputMode("append")
+         .format("console")
+         .option("truncate", False)
+         .start())
 query.awaitTermination()
