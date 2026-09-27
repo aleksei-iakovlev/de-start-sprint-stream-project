@@ -9,37 +9,42 @@ kafka_security_options = {
     'kafka.sasl.mechanism': 'SCRAM-SHA-512',
     'kafka.sasl.jaas.config': 'org.apache.kafka.common.security.scram.ScramLoginModule required username=\"de-student\" password=\"ltcneltyn\";'
 }
+postgres_security_options = {
+    'user': 'jovyan',
+    'password': 'jovyan'
+}
 
 
 # метод для записи данных в 2 target: в PostgreSQL для фидбэков и в Kafka для триггеров
 def foreach_batch_function(df, epoch_id):
     # сохраняем df в памяти, чтобы не создавать df заново перед отправкой в Kafka
     df.cache()
-    # записываем df в PostgreSQL с полем feedback
-    df_feedback = df.withColumn("trigger_datetime_created", current_timestamp_utc)\
-        .withColumn("feedback")
-    (df_feedback.write
-        .format("jdbc")
-        .option("url", "jdbc:postgresql://localhost:5432/de")
-        .option("driver", "org.postgresql.Driver")
-        .option("dbtable", "public.subscribers_feedback")
-        .option("user", "jovyan")
-        .option("password", "jovyan")
-        .mode("append")
-        .save())
-    # создаём df для отправки в Kafka. Сериализация в json.
-    kafka_df = df.select(
-        f.col("restaurant_id").cast("string").alias("key"),
-        f.to_json(f.struct(*[f.col(c) for c in df.columns])).alias("value"))
-    # отправляем сообщения в результирующий топик Kafka без поля feedback
-    (kafka_df.write
-        .format("kafka")
-        .option("kafka.bootstrap.servers", "rc1b-2erh7b35n4j4v869.mdb.yandexcloud.net:9091")
-        .option("topic", TOPIC_NAME_OUT)
-        .options(**kafka_security_options)
-        .save())
+
+    try:
+        # записываем df в PostgreSQL с полем feedback
+        df_feedback = df.withColumn("feedback", "")
+        (df_feedback.write
+            .format("jdbc")
+            .option("url", "jdbc:postgresql://localhost:5432/de")
+            .option("driver", "org.postgresql.Driver")
+            .option("dbtable", "public.subscribers_feedback")
+            .options(**postgres_security_options)
+            .mode("append")
+            .save())
+        # создаём df для отправки в Kafka. Сериализация в json.
+        kafka_df = df.select(
+            f.col("restaurant_id").cast("string").alias("key"),
+            f.to_json(f.struct(*[f.col(c) for c in df.columns])).alias("value"))
+        # отправляем сообщения в результирующий топик Kafka без поля feedback
+        (kafka_df.write
+            .format("kafka")
+            .option("kafka.bootstrap.servers", "rc1b-2erh7b35n4j4v869.mdb.yandexcloud.net:9091")
+            .option("topic", TOPIC_NAME_OUT)
+            .options(**kafka_security_options)
+            .save())
     # очищаем память от df
-    df.unpersist()
+    finally:
+        df.unpersist()
 
 
 # необходимые библиотеки для интеграции Spark с Kafka и PostgreSQL
@@ -78,7 +83,7 @@ incomming_message_schema = StructType([
 ])
 
 # определяем текущее время в UTC в миллисекундах, затем округляем до секунд
-current_timestamp_utc = int(round(f.unix_timestamp(f.current_timestamp())))
+current_timestamp_utc = f.unix_timestamp()
 
 # десериализуем из value сообщения json и фильтруем по времени старта и окончания акции
 filtered_read_stream_df = (restaurant_read_stream_df
@@ -102,7 +107,7 @@ subscribers_restaurant_df = (spark.read
 # джойним данные из сообщения Kafka с пользователями подписки по restaurant_id (uuid). Добавляем время создания события.
 result_df = (filtered_read_stream_df.join(subscribers_restaurant_df, "restaurant_id")
              .dropDuplicates()
-             .withColumn("current_date", f.current_date()))
+             .withColumn("trigger_datetime_created", f.current_timestamp()))
 
 # запускаем стриминг
 result_df.writeStream \
