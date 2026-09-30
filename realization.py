@@ -1,9 +1,10 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as f
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from pyspark.sql.types import StructType, StructField, StringType, LongType
 
 TOPIC_NAME_IN = 'student.topic.cohort16.alex'
 TOPIC_NAME_OUT = 'student.topic.cohort16.alex.out'
+CHECKPOINT_LOCATION = 'checkpoints/restaurant_subscribe'
 kafka_security_options = {
     'kafka.security.protocol': 'SASL_SSL',
     'kafka.sasl.mechanism': 'SCRAM-SHA-512',
@@ -21,8 +22,9 @@ def foreach_batch_function(df, epoch_id):
     df.cache()
 
     try:
-        # записываем df в PostgreSQL с полем feedback
-        df_feedback = df.withColumn("feedback", "")
+        df_out = df.drop("event_time")
+        # в Postgres не пишем id подписчика: это PK serial в subscribers_feedback
+        df_feedback = df_out.drop("id").withColumn("feedback", f.lit(None).cast(StringType()))
         (df_feedback.write
             .format("jdbc")
             .option("url", "jdbc:postgresql://localhost:5432/de")
@@ -31,10 +33,10 @@ def foreach_batch_function(df, epoch_id):
             .options(**postgres_security_options)
             .mode("append")
             .save())
-        # создаём df для отправки в Kafka. Сериализация в json.
-        kafka_df = df.select(
+        # в Kafka id подписчика остаётся в json
+        kafka_df = df_out.select(
             f.col("restaurant_id").cast("string").alias("key"),
-            f.to_json(f.struct(*[f.col(c) for c in df.columns])).alias("value"))
+            f.to_json(f.struct(*[f.col(c) for c in df_out.columns])).alias("value"))
         # отправляем сообщения в результирующий топик Kafka без поля feedback
         (kafka_df.write
             .format("kafka")
@@ -77,9 +79,9 @@ incomming_message_schema = StructType([
     StructField("adv_campaign_content", StringType(), True),
     StructField("adv_campaign_owner", StringType(), True),
     StructField("adv_campaign_owner_contact", StringType(), True),
-    StructField("adv_campaign_datetime_start", DoubleType(), True),
-    StructField("adv_campaign_datetime_end", DoubleType(), True),
-    StructField("datetime_created", DoubleType(), True),
+    StructField("adv_campaign_datetime_start", LongType(), True),
+    StructField("adv_campaign_datetime_end", LongType(), True),
+    StructField("datetime_created", LongType(), True),
 ])
 
 # определяем текущее время в UTC в миллисекундах, затем округляем до секунд
@@ -92,6 +94,8 @@ filtered_read_stream_df = (restaurant_read_stream_df
                            .selectExpr("event.*")
                            .where((current_timestamp_utc < f.col("adv_campaign_datetime_end"))
                                   & (current_timestamp_utc > f.col("adv_campaign_datetime_start")))
+                           .withColumn("event_time", f.col("datetime_created").cast("timestamp"))
+                           .withWatermark("event_time", "1 hour")
                            )
 
 # вычитываем всех пользователей с подпиской на рестораны
@@ -106,11 +110,12 @@ subscribers_restaurant_df = (spark.read
 
 # джойним данные из сообщения Kafka с пользователями подписки по restaurant_id (uuid). Добавляем время создания события.
 result_df = (filtered_read_stream_df.join(subscribers_restaurant_df, "restaurant_id")
-             .dropDuplicates()
-             .withColumn("trigger_datetime_created", f.current_timestamp()))
+             .dropDuplicates(["client_id", "restaurant_id", "adv_campaign_id"])
+             .withColumn("trigger_datetime_created", f.unix_timestamp().cast("int")))
 
 # запускаем стриминг
 result_df.writeStream \
+    .option("checkpointLocation", CHECKPOINT_LOCATION) \
     .foreachBatch(foreach_batch_function) \
     .start() \
     .awaitTermination()
